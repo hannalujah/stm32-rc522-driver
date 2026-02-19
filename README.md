@@ -10,12 +10,12 @@ The driver is functional and will be cleaned, modularized, and documented in fut
 src/
 main.c
 rc522.c
-rc522_main.c
+rc522_dma.c
 
 include/
 main.h
 rc522.h
-rc522_main.h
+rc522_dma.h
 
 
 ## Notes
