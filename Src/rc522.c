@@ -1,3 +1,18 @@
+/**
+
+
+ */
+#include "main.h"
+#include "string.h"
+#include "rc522.h"
+
+#define M_RC522_TIMING_TIMECONFIG	20
+#define	M_RC522_TIMING_NOTDETECTED  30000
+#define M_RC522_TIMING_TIMEOUT 		300000
+#define M_RC522_TIMING_CARDVALID	1000
+#define M_RC522_VALIDATION_TRYCOUNT 5
+#define M_RC522_VALIDATION_TIMEOUT  2000
+#define M_CONFIG_RC522_SPIHANDLE    hspi2
 
 /*
  * Function Name: RC522_SPI_Transfer
@@ -6,8 +21,6 @@
  * Returns: a byte of data read from the module
  */
 
-#include "main.h"
-#include "rc522.h"
 uint8_t RC522_SPI_Transfer(uchar data)
 {
 	uchar rx_data;
@@ -83,19 +96,6 @@ void SetBitMask(uchar reg, uchar mask)
 }
 
 /*
- * Function Name: ClearBitMask
- * Description: clear RC522 register bit
- * Input parameters: reg - register address; mask - clear bit value
- * Return value: None
-*/
-void ClearBitMask(uchar reg, uchar mask)
-{
-    uchar tmp;
-    tmp = Read_MFRC522(reg);
-    Write_MFRC522(reg, tmp & (~mask));  // clear bit mask
-}
-
-/*
  * Function Name: AntennaOn
  * Description: Open antennas, each time you start or shut down the natural barrier between the transmitter should be at least 1ms interval
  * Input: None
@@ -106,17 +106,6 @@ void AntennaOn(void)
 
 	Read_MFRC522(TxControlReg);
 	SetBitMask(TxControlReg, 0x03);
-}
-
-/*
-  * Function Name: AntennaOff
-  * Description: Close antennas, each time you start or shut down the natural barrier between the transmitter should be at least 1ms interval
-  * Input: None
-  * Return value: None
- */
-void AntennaOff(void)
-{
-	ClearBitMask(TxControlReg, 0x03);
 }
 
 /*
@@ -152,381 +141,582 @@ void MFRC522_Init(void)
 	AntennaOn();
 }
 
-/*
- * Function Name: MFRC522_ToCard
- * Description: RC522 and ISO14443 card communication
- * Input Parameters: command - MF522 command word,
- *			 sendData--RC522 sent to the card by the data
- *			 sendLen--Length of data sent
- *			 backData--Received the card returns data,
- *			 backLen--Return data bit length
- * Return value: the successful return MI_OK
- */
-uchar MFRC522_ToCard(uchar command, uchar *sendData, uchar sendLen, uchar *backData, uint *backLen)
+
+// Prototyping the functions used later
+void Module_init(void);
+void Module_deinit(void);
+void ReadRFID(void);
+void ResetRFID(void);
+
+uint8_t test;
+_Bool rfidOFFtoCard = 0;
+_Bool rfidOFFwrite = 0;
+_Bool rfidOFFread = 0;
+
+
+typedef enum {
+	M_RC522_READSTEP_FINDCARD,
+	M_RC522_READSTEP_FINDCARD_PCDTRANSCEIVE,
+	M_RC522_READSTEPS_FINDCARD_CHECKTAGTYPE,
+	M_RC522_READSTEP_GETID,
+	M_RC522_READSTEP_GETID_PCDTRANSCEIVE,
+	M_RC522_READSTEPS_CHECKID,
+	M_RC522_READSTEP_VERIFYID
+}e_rc522_readCardSteps_typedef;
+
+typedef enum{
+	M_RC522_READWRITE_STEP_ONE,
+	M_RC522_READWRITE_STEP_TWO
+}e_rc522_read_write_step_typedef;
+
+typedef enum {
+	M_RC522_TOCARD_STEP_WRITEIENREG,
+	M_RC522_TOCARD_STEP_CLEARIRQREG_READ,
+	M_RC522_TOCARD_STEP_CLEARIRQREG_WRITE,
+	M_RC522_TOCARD_STEP_SETFIFOLEVEL_READ,
+	M_RC522_TOCARD_STEP_SETFIFOLEVEL_WRITE,
+	M_RC522_TOCARD_STEP_WRITECOMMANDREGIDLE,
+	M_RC522_TOCARD_STEP_WRITEFIFODATAREG,
+	M_RC522_TOCARD_STEP_WRITECOMMANDREG,
+	M_RC522_TOCARD_STEP_SETBITFRAMING_READ,
+	M_RC522_TOCARD_STEP_SETBITFRAMING_WRITE,
+	M_RC522_TOCARD_STEP_READIRQREG,
+	M_RC522_TOCARD_STEP_CHECKIRQREG,
+	M_RC522_TOCARD_STEP_CLEARBITFRAMING_READ,
+	M_RC522_TOCARD_STEP_CLEARBITFRAMING_WRITE,
+	M_RC522_TOCARD_STEP_READERRORREG,
+	M_RC522_TOCARD_STEP_READFIFOLEVEL,
+	M_RC522_TOCARD_STEP_READCONTROLREG,
+	M_RC522_TOCARD_STEP_CHECKLASTBITS,
+	M_RC522_TOCARD_STEP_READFIFODATA_ONE,
+	M_RC522_TOCARD_STEP_READFIFODATA_TWO
+}e_rc522_toCard_step_typedef;
+
+typedef struct {
+	e_rc522_readCardSteps_typedef   step;
+	e_rc522_toCard_step_typedef     toCardStep;
+
+	uint8_t                         status;
+	uint8_t                         backData[MAX_LEN];
+	uint8_t                         backLen;
+
+	uint8_t                         tagType[2];
+	uint8_t                         checkID[5];
+	uint8_t                         checkIDPrev[5];
+
+	uint8_t                         irqEn;
+	uint8_t                         waitIrq;
+
+	uint8_t                         n;
+	uint8_t                         ifnSet;
+	uint8_t                         i;
+	uint8_t                         lastBits;
+	uint8_t                         serNumCheck;
+	uint8_t                         verificationTries;
+
+	uint8_t                         txData[2];
+	uint8_t                         rxData[2];
+	uint8_t                         readData;
+	_Bool                           DMATxResponse;
+	_Bool                           DMATxRxResponse;
+	uint16_t                        validationTimeOut;
+}s_rc522_DMA_structure;
+s_rc522_DMA_structure s_rc522_DMA = {0};
+
+typedef struct {
+	uint32_t 					     timeConf;
+	uint32_t 						 onTime;
+	uint32_t 						 readingTries;
+	uint32_t 						 detectionTimeoutTicker;
+	uint32_t 						 detectionFailsafeTimeoutTicker;
+	uint32_t 						 detectionMaximumValidTimeoutTicker;
+	uint8_t							 checkID[M_RC522_CARDID_MAXLEN];
+	uint8_t							 checkIDPREV[M_RC522_CARDID_MAXLEN];
+}s_rc522_internal_structure;
+static s_rc522_internal_structure s_rc522_internal = {0};
+
+s_rc522_structure s_rc522 = {0};
+void RC522_init()
 {
-    uchar status = MI_ERR;
-    uchar irqEn = 0x00;
-    uchar waitIRq = 0x00;
-    uchar lastBits;
-    uchar n;
-    uint i;
+	/************************************************************/
+	if (!s_rc522.s_config.detectionTimeout)          s_rc522.s_config.detectionTimeout 		    = M_RC522_TIMING_NOTDETECTED;
+	if (!s_rc522.s_config.detectionFailsafeTimeout)  s_rc522.s_config.detectionFailsafeTimeout  = M_RC522_TIMING_TIMEOUT;
+	if (!s_rc522.s_config.confirmationTries)         s_rc522.s_config.confirmationTries         = M_RC522_VALIDATION_TRYCOUNT;
+	if (!s_rc522.s_config.detectionMaximumValidTime) s_rc522.s_config.detectionMaximumValidTime = M_RC522_TIMING_CARDVALID;
 
-    switch (command)
-    {
-        case PCD_AUTHENT:		// Certification cards close
-		{
-			irqEn = 0x12;
-			waitIRq = 0x10;
-			break;
-		}
-		case PCD_TRANSCEIVE:	// Transmit FIFO data
-		{
-			irqEn = 0x77;
-			waitIRq = 0x30;
-			break;
-		}
-		default:
-			break;
-    }
+}
 
-    Write_MFRC522(CommIEnReg, irqEn|0x80);	// Interrupt request
-    ClearBitMask(CommIrqReg, 0x80);			// Clear all interrupt request bit
-    SetBitMask(FIFOLevelReg, 0x80);			// FlushBuffer=1, FIFO Initialization
+void RC522_startDetection(void)
+{
+	if (!s_rc522.s_status.s_detection.isModuleOn)
+	{
+		memset(&(s_rc522_DMA), RESET, sizeof(s_rc522_DMA_structure));
+		memset(&(s_rc522_internal), RESET, sizeof(s_rc522_internal_structure));
 
-	Write_MFRC522(CommandReg, PCD_IDLE);	// NO action; Cancel the current command
+		HAL_GPIO_WritePin(MFRC522_CS_PORT, MFRC522_CS_PIN, GPIO_PIN_SET);
+		HAL_GPIO_WritePin(MFRC522_RST_GPIO_Port, MFRC522_RST_Pin, GPIO_PIN_SET);
+		HAL_Delay(2);
+		s_rc522.s_status.s_detection.isModuleOn = SET;
 
-	// Writing data to the FIFO
-    for (i=0; i<sendLen; i++)
-    {
-		Write_MFRC522(FIFODataReg, sendData[i]);
+		Module_init();
+
+		/* Initialization Complete */
+		s_rc522.s_status.s_detection.isDetectionEnabled = SET; // Enabling the RFID Module
+		s_rc522.s_status.s_detection.isModuleOn = SET;
 	}
+}
 
+void RC522_run(void)
+{
 
-    // Execute the command
-	Write_MFRC522(CommandReg, command);
-    if (command == PCD_TRANSCEIVE)
-    {
-		SetBitMask(BitFramingReg, 0x80);		// StartSend=1,transmission of data starts
+	if (s_rc522.s_status.s_detection.isInitialized && s_rc522.s_status.s_detection.isModuleOn)
+	{
+		ReadRFID(); // reading the cards in case we'd initialized the module beforehand
 	}
+}
 
-    // Waiting to receive data to complete
-	i = 25;	// i according to the clock frequency adjustment, the operator M1 card maximum waiting time 25ms
-    do
-    {
-		//CommIrqReg[7..0]
-		//Set1 TxIRq RxIRq IdleIRq HiAlerIRq LoAlertIRq ErrIRq TimerIRq
-        n = Read_MFRC522(CommIrqReg);
-        i--;
-    }
-    while ((i!=0) && !(n&0x01) && !(n&waitIRq));
-    ClearBitMask(BitFramingReg, 0x80);			//StartSend=0
 
-    if (i != 0)
-    {
-        if(!(Read_MFRC522(ErrorReg) & 0x1B))	//BufferOvfl Collerr CRCErr ProtecolErr
-        {
-            status = MI_OK;
-            if (n & irqEn & 0x01)
-            {
-				status = MI_NOTAGERR;
+
+void RC522_tick()
+{
+	s_rc522_internal.onTime++;
+	s_rc522_internal.detectionTimeoutTicker++;
+	s_rc522_internal.detectionFailsafeTimeoutTicker++;
+	s_rc522_internal.detectionMaximumValidTimeoutTicker++;
+	s_rc522_DMA.validationTimeOut++;
+}
+
+
+void Module_init(void)
+{
+	MFRC522_Init();
+
+	s_rc522.s_status.s_detection.isInitialized = SET;
+
+	s_rc522_DMA.irqEn = 0x77;
+	s_rc522_DMA.waitIrq = 0x30;
+}
+
+
+
+
+HAL_StatusTypeDef RC522_toCard_nonBlocking (uint8_t command, uint8_t* sendData, uint8_t sendLen, uint8_t* backData, uint8_t* backLen){
+
+	static e_rc522_toCard_step_typedef toCardSteps = M_RC522_TOCARD_STEP_WRITEIENREG;
+	if (rfidOFFtoCard)
+	{
+		rfidOFFtoCard = RESET;
+		toCardSteps = M_RC522_TOCARD_STEP_WRITEIENREG;
+	}
+	switch (toCardSteps)
+	{
+	case M_RC522_TOCARD_STEP_WRITEIENREG:
+		s_rc522_DMA.status = MI_ERR;
+		if (RC522_Write(CommIEnReg, (s_rc522_DMA.irqEn | 0x80)) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_CLEARIRQREG_READ:
+		if (RC522_Read(CommIrqReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_CLEARIRQREG_WRITE:
+		if (RC522_Write(CommIrqReg, (s_rc522_DMA.readData & (~0x80))) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_SETFIFOLEVEL_READ:
+		if (RC522_Read(FIFOLevelReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_SETFIFOLEVEL_WRITE:
+		if (RC522_Write(FIFOLevelReg, (s_rc522_DMA.readData | 0x80)) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_WRITECOMMANDREGIDLE:
+		s_rc522_DMA.i = 0;
+		if (RC522_Write(CommandReg, PCD_IDLE) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_WRITEFIFODATAREG:
+		if (s_rc522_DMA.i < sendLen)
+		{
+			if (RC522_Write(FIFODataReg, sendData[s_rc522_DMA.i]) == HAL_OK)
+			{
+				s_rc522_DMA.i++;
 			}
-
-            if (command == PCD_TRANSCEIVE)
-            {
-               	n = Read_MFRC522(FIFOLevelReg);
-              	lastBits = Read_MFRC522(ControlReg) & 0x07;
-                if (lastBits)
-                {
-					*backLen = (n-1)*8 + lastBits;
-				}
-                else
-                {
-					*backLen = n*8;
-				}
-
-                if (n == 0)
-                {
-					n = 1;
-				}
-                if (n > MAX_LEN)
-                {
-					n = MAX_LEN;
-				}
-
-                // Reading the received data in FIFO
-                for (i=0; i<n; i++)
-                {
-					backData[i] = Read_MFRC522(FIFODataReg);
-				}
-            }
-        }
-        else
-        {
-			status = MI_ERR;
+			break;
 		}
+		toCardSteps++;
+		break;
 
-    }
+	case M_RC522_TOCARD_STEP_WRITECOMMANDREG:
+		if (RC522_Write(CommandReg, command) == HAL_OK) toCardSteps++;
+		break;
 
-    //SetBitMask(ControlReg,0x80);           //timer stops
-    //Write_MFRC522(CommandReg, PCD_IDLE);
+	case M_RC522_TOCARD_STEP_SETBITFRAMING_READ:
+		if (RC522_Read(BitFramingReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
 
-    return status;
-}
+	case M_RC522_TOCARD_STEP_SETBITFRAMING_WRITE:
+		if (RC522_Write(BitFramingReg, (s_rc522_DMA.readData | 0x80)) == HAL_OK) toCardSteps++;
+		s_rc522_DMA.i = 0;
+		break;
 
-/*
- * Function Name: MFRC522_Request
- * Description: Find cards, read the card type number
- * Input parameters: reqMode - find cards way
- *   TagType - Return Card Type
- *    0x4400 = Mifare_UltraLight
- *    0x0400 = Mifare_One(S50)
- *    0x0200 = Mifare_One(S70)
- *    0x0800 = Mifare_Pro(X)
- *    0x4403 = Mifare_DESFire
- * Return value: the successful return MI_OK
- */
-uchar MFRC522_Request(uchar reqMode, uchar *TagType)
-{
-	uchar status;
-	uint backBits;			 // The received data bits
+	case M_RC522_TOCARD_STEP_READIRQREG:
+		if (RC522_Read(CommIrqReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
 
-
-	Write_MFRC522(BitFramingReg, 0x07);		//TxLastBists = BitFramingReg[2..0]
-
-	TagType[0] = reqMode;
-	status = MFRC522_ToCard(PCD_TRANSCEIVE, TagType, 1, TagType, &backBits);
-
-	if ((status != MI_OK) || (backBits != 0x10))
-	{
-		status = MI_ERR;
-	}
-
-	return status;
-}
-
-/*
- * Function Name: MFRC522_Anticoll
- * Description: Anti-collision detection, reading selected card serial number card
- * Input parameters: serNum - returns 4 bytes card serial number, the first 5 bytes for the checksum byte
- * Return value: the successful return MI_OK
- */
-uchar MFRC522_Anticoll(uchar *serNum)
-{
-    uchar status;
-    uchar i;
-	uchar serNumCheck=0;
-    uint unLen;
-
-	Write_MFRC522(BitFramingReg, 0x00);		//TxLastBists = BitFramingReg[2..0]
-    serNum[0] = PICC_ANTICOLL;
-    serNum[1] = 0x20;
-    status = MFRC522_ToCard(PCD_TRANSCEIVE, serNum, 2, serNum, &unLen);
-
-    if (status == MI_OK)
-	{
-    	 //Check card serial number
-		for (i=0; i<4; i++)
+	case M_RC522_TOCARD_STEP_CHECKIRQREG:
+		s_rc522_DMA.n = s_rc522_DMA.readData;
+		if (!(s_rc522_DMA.n & 0x01) && !(s_rc522_DMA.n & s_rc522_DMA.waitIrq))
 		{
-		 	serNumCheck ^= serNum[i];
+			if (++s_rc522_DMA.i > 25)
+			{
+				toCardSteps = RESET;
+				return HAL_ERROR;
+			}
+			toCardSteps = M_RC522_TOCARD_STEP_READIRQREG;
+			break;
 		}
-		if (serNumCheck != serNum[i])
+		toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_CLEARBITFRAMING_READ:
+		if (RC522_Read(BitFramingReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_CLEARBITFRAMING_WRITE:
+		if (RC522_Write(BitFramingReg, (s_rc522_DMA.readData & (~0x80))) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_READERRORREG:
+		if (RC522_Read(ErrorReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_READFIFOLEVEL:
+		if ((s_rc522_DMA.readData & 0x1B))
 		{
-			status = MI_ERR;
+			s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD;
+			toCardSteps = RESET;
+			break;
+			// ERROR
 		}
-    }
-
-    return status;
-}
-
-/*
- * Function Name: CalulateCRC
- * Description: CRC calculation with MF522
- * Input parameters: pIndata - To read the CRC data, len - the data length, pOutData - CRC calculation results
- * Return value: None
- */
-void CalulateCRC(uchar *pIndata, uchar len, uchar *pOutData)
-{
-    uchar i, n;
-
-    ClearBitMask(DivIrqReg, 0x04);			//CRCIrq = 0
-    SetBitMask(FIFOLevelReg, 0x80);			//Clear the FIFO pointer
-
-    //Writing data to the FIFO
-    for (i=0; i<len; i++)
-    {
-		Write_MFRC522(FIFODataReg, *(pIndata+i));
-	}
-    Write_MFRC522(CommandReg, PCD_CALCCRC);
-
-    //Wait CRC calculation is complete
-    i = 0xFF;
-    do
-    {
-        n = Read_MFRC522(DivIrqReg);
-        i--;
-    }
-    while ((i!=0) && !(n&0x04));			//CRCIrq = 1
-
-    //Read CRC calculation result
-    pOutData[0] = Read_MFRC522(CRCResultRegL);
-    pOutData[1] = Read_MFRC522(CRCResultRegH);
-}
-
-/*
- * Function Name: MFRC522_SelectTag
- * Description: election card, read the card memory capacity
- * Input parameters: serNum - Incoming card serial number
- * Return value: the successful return of card capacity
- */
-uchar MFRC522_SelectTag(uchar *serNum)
-{
-	uchar i;
-	uchar status;
-	uchar size;
-	uint recvBits;
-	uchar buffer[9];
-
-	//ClearBitMask(Status2Reg, 0x08);			//MFCrypto1On=0
-
-    buffer[0] = PICC_SElECTTAG;
-    buffer[1] = 0x70;
-    for (i=0; i<5; i++)
-    {
-    	buffer[i+2] = *(serNum+i);
-    }
-	CalulateCRC(buffer, 7, &buffer[7]);
-    status = MFRC522_ToCard(PCD_TRANSCEIVE, buffer, 9, buffer, &recvBits);
-
-    if ((status == MI_OK) && (recvBits == 0x18))
-    {
-		size = buffer[0];
-	}
-    else
-    {
-		size = 0;
-	}
-
-    return size;
-}
-
-/*
- * Function Name: MFRC522_Auth
- * Description: Verify card password
- * Input parameters: authMode - Password Authentication Mode
-                 0x60 = A key authentication
-                 0x61 = Authentication Key B
-             BlockAddr--Block address
-             Sectorkey--Sector password
-             serNum--Card serial number, 4-byte
- * Return value: the successful return MI_OK
- */
-uchar MFRC522_Auth(uchar authMode, uchar BlockAddr, uchar *Sectorkey, uchar *serNum)
-{
-    uchar status;
-    uint recvBits;
-    uchar i;
-	uchar buff[12];
-
-	//Verify the command block address + sector + password + card serial number
-    buff[0] = authMode;
-    buff[1] = BlockAddr;
-    for (i=0; i<6; i++)
-    {
-		buff[i+2] = *(Sectorkey+i);
-	}
-    for (i=0; i<4; i++)
-    {
-		buff[i+8] = *(serNum+i);
-	}
-    status = MFRC522_ToCard(PCD_AUTHENT, buff, 12, buff, &recvBits);
-
-    if ((status != MI_OK) || (!(Read_MFRC522(Status2Reg) & 0x08)))
-    {
-		status = MI_ERR;
-	}
-
-    return status;
-}
-
-/*
- * Function Name: MFRC522_Read
- * Description: Read block data
- * Input parameters: blockAddr - block address; recvData - read block data
- * Return value: the successful return MI_OK
- */
-uchar MFRC522_Read(uchar blockAddr, uchar *recvData)
-{
-    uchar status;
-    uint unLen;
-
-    recvData[0] = PICC_READ;
-    recvData[1] = blockAddr;
-    CalulateCRC(recvData,2, &recvData[2]);
-    status = MFRC522_ToCard(PCD_TRANSCEIVE, recvData, 4, recvData, &unLen);
-
-    if ((status != MI_OK) || (unLen != 0x90))
-    {
-        status = MI_ERR;
-    }
-
-    return status;
-}
-
-/*
- * Function Name: MFRC522_Write
- * Description: Write block data
- * Input parameters: blockAddr - block address; writeData - to 16-byte data block write
- * Return value: the successful return MI_OK
- */
-uchar MFRC522_Write(uchar blockAddr, uchar *writeData)
-{
-    uchar status;
-    uint recvBits;
-    uchar i;
-	uchar buff[18];
-
-    buff[0] = PICC_WRITE;
-    buff[1] = blockAddr;
-    CalulateCRC(buff, 2, &buff[2]);
-    status = MFRC522_ToCard(PCD_TRANSCEIVE, buff, 4, buff, &recvBits);
-
-    if ((status != MI_OK) || (recvBits != 4) || ((buff[0] & 0x0F) != 0x0A))
-    {
-		status = MI_ERR;
-	}
-
-    if (status == MI_OK)
-    {
-        for (i=0; i<16; i++)		//Data to the FIFO write 16Byte
-        {
-        	buff[i] = *(writeData+i);
-        }
-        CalulateCRC(buff, 16, &buff[16]);
-        status = MFRC522_ToCard(PCD_TRANSCEIVE, buff, 18, buff, &recvBits);
-
-		if ((status != MI_OK) || (recvBits != 4) || ((buff[0] & 0x0F) != 0x0A))
-        {
-			status = MI_ERR;
+		s_rc522_DMA.status = MI_OK;
+		if (s_rc522_DMA.n & s_rc522_DMA.irqEn & 0x01)
+		{
+			s_rc522_DMA.status = MI_NOTAGERR;
 		}
-    }
+		if (RC522_Read(FIFOLevelReg, &s_rc522_DMA.readData) == HAL_OK)	toCardSteps++;
+		break;
 
-    return status;
+	case M_RC522_TOCARD_STEP_READCONTROLREG:
+		if (!s_rc522_DMA.ifnSet)
+		{
+			s_rc522_DMA.n = s_rc522_DMA.readData;
+			s_rc522_DMA.ifnSet = SET;
+		}
+		if (RC522_Read(ControlReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_CHECKLASTBITS:
+		s_rc522_DMA.ifnSet = RESET;
+		s_rc522_DMA.lastBits = (s_rc522_DMA.readData & 0x07);
+		if (s_rc522_DMA.lastBits)
+		{
+			*backLen = ((s_rc522_DMA.n - 1)*8) + s_rc522_DMA.lastBits;
+		}
+		else
+		{
+			*backLen = (s_rc522_DMA.n)*8;
+		}
+
+		if (s_rc522_DMA.n == 0)           s_rc522_DMA.n = 1;
+		if (s_rc522_DMA.n > MAX_LEN) s_rc522_DMA.n = MAX_LEN;
+
+		s_rc522_DMA.i = 0;
+		toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_READFIFODATA_ONE:
+		if (RC522_Read(FIFODataReg, &s_rc522_DMA.readData) == HAL_OK) toCardSteps++;
+		break;
+
+	case M_RC522_TOCARD_STEP_READFIFODATA_TWO:
+		if (s_rc522_DMA.i < s_rc522_DMA.n)
+		{
+			backData[s_rc522_DMA.i] = s_rc522_DMA.readData;
+			s_rc522_DMA.i++;
+			toCardSteps = M_RC522_TOCARD_STEP_READFIFODATA_ONE;
+			break;
+		}
+		else
+		{
+			s_rc522_DMA.step++;
+			toCardSteps = RESET;
+			return HAL_OK;
+		}
+
+		break;
+	}
+	return HAL_BUSY;
 }
 
-/*
- * Function Name: MFRC522_Halt
- * Description: Command card into hibernation
- * Input: None
- * Return value: None
- */
-void MFRC522_Halt(void)
+
+
+void ReadRFID(void)
 {
-	uint unLen;
-	uchar buff[4];
 
-	buff[0] = PICC_HALT;
-	buff[1] = 0;
-	CalulateCRC(buff, 2, &buff[2]);
+	HAL_StatusTypeDef result = HAL_ERROR;
+	switch (s_rc522_DMA.step)
+	{
+	case M_RC522_READSTEP_FINDCARD:
+		if(RC522_Write(BitFramingReg, 0x07) == HAL_OK){
+			s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD_PCDTRANSCEIVE;
+			s_rc522_DMA.backData[0] = PICC_REQIDL;
+		}
+		break;
 
-	MFRC522_ToCard(PCD_TRANSCEIVE, buff, 4, buff,&unLen);
+	case M_RC522_READSTEP_FINDCARD_PCDTRANSCEIVE:
+
+		result = RC522_toCard_nonBlocking(PCD_TRANSCEIVE, s_rc522_DMA.backData, 1, s_rc522_DMA.backData, &s_rc522_DMA.backLen);
+		if(result == HAL_OK){
+			s_rc522_DMA.step = M_RC522_READSTEPS_FINDCARD_CHECKTAGTYPE;
+		}else if (result == HAL_ERROR) {
+			s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD;
+		}
+		break;
+
+	case M_RC522_READSTEPS_FINDCARD_CHECKTAGTYPE:
+		if ((s_rc522_DMA.backLen != 0x10) || (s_rc522_DMA.status != MI_OK))
+		{
+			s_rc522_DMA.step = RESET;
+			memset(s_rc522_DMA.backData, RESET, sizeof(s_rc522_DMA.backData));
+			memset(s_rc522_DMA.tagType, RESET, sizeof(s_rc522_DMA.tagType));
+			s_rc522_DMA.backLen = RESET;
+			memset(s_rc522_DMA.checkID, RESET, sizeof(s_rc522_DMA.checkID));
+			// RESET CHECK ID
+			break;
+		}
+		memcpy(s_rc522_DMA.tagType, s_rc522_DMA.backData, sizeof(s_rc522_DMA.tagType));
+		memset(s_rc522_DMA.backData, RESET, sizeof(s_rc522_DMA.backData));
+		s_rc522_DMA.step = M_RC522_READSTEP_GETID;
+		break;
+
+	case M_RC522_READSTEP_GETID:
+		if(RC522_Write(BitFramingReg, 0x00) == HAL_OK){
+			s_rc522_DMA.step = M_RC522_READSTEP_GETID_PCDTRANSCEIVE;
+			s_rc522_DMA.backData[0] = PICC_ANTICOLL;
+			s_rc522_DMA.backData[1] = 0x20;
+		}
+		break;
+
+	case M_RC522_READSTEP_GETID_PCDTRANSCEIVE:
+		result = RC522_toCard_nonBlocking(PCD_TRANSCEIVE, s_rc522_DMA.backData, 2, s_rc522_DMA.backData, &s_rc522_DMA.backLen);
+		if(result == HAL_OK){
+			s_rc522_DMA.step = M_RC522_READSTEPS_CHECKID;
+		}else if (result == HAL_ERROR) {
+			s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD;
+		}
+		break;
+
+	case M_RC522_READSTEPS_CHECKID:
+		if (s_rc522_DMA.status == MI_OK)
+		{
+			s_rc522_DMA.serNumCheck = 0;
+			for (s_rc522_DMA.i = 0; s_rc522_DMA.i < 4; s_rc522_DMA.i++)
+			{
+				s_rc522_DMA.serNumCheck ^= s_rc522_DMA.backData[s_rc522_DMA.i];
+			}
+			if (s_rc522_DMA.serNumCheck != s_rc522_DMA.backData[4])
+			{
+				// ERROR / RESET
+				s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD;
+				memset(s_rc522_DMA.backData, RESET, sizeof(s_rc522_DMA.backData));
+				// RESET CHECKIDPREV
+				memset(s_rc522_DMA.checkIDPrev, RESET, sizeof(s_rc522_DMA.checkIDPrev));
+				s_rc522_DMA.verificationTries = RESET;
+				break;
+			}
+			else
+			{
+				// OK
+				memcpy(s_rc522_DMA.checkID, s_rc522_DMA.backData, sizeof(s_rc522_DMA.checkID));
+				s_rc522_DMA.step = M_RC522_READSTEP_VERIFYID;
+				break;
+			}
+		}
+		s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD;
+		memset(s_rc522_DMA.backData, RESET, sizeof(s_rc522_DMA.backData));
+		// RESET CHECKIDPREV
+		memset(s_rc522_DMA.checkIDPrev, RESET, sizeof(s_rc522_DMA.checkIDPrev));
+		break;
+
+	case M_RC522_READSTEP_VERIFYID:
+		if (memcmp(s_rc522_DMA.checkIDPrev, s_rc522_DMA.checkID, sizeof(s_rc522_DMA.checkID)))
+		{
+			memcpy(s_rc522_DMA.checkIDPrev, s_rc522_DMA.checkID, sizeof(s_rc522_DMA.checkID));
+			s_rc522.s_status.s_IDStatus.isIDValid = RESET;
+			s_rc522_DMA.verificationTries = RESET;
+		}
+		else
+		{
+			if (!s_rc522.s_status.s_IDStatus.isIDValid)
+			{
+				if (++s_rc522_DMA.verificationTries > M_RC522_VALIDATION_TRYCOUNT)
+				{
+					// VALID CARD
+					s_rc522_DMA.validationTimeOut = RESET;
+					s_rc522.s_status.s_IDStatus.isIDValid = SET;
+					s_rc522.s_status.s_IDStatus.isUnreadWaiting = SET;
+					memcpy(s_rc522.s_status.s_IDStatus.cardID, s_rc522_DMA.checkID, sizeof(s_rc522_DMA.checkID));
+					break;
+				}
+			}
+			else if (s_rc522_DMA.validationTimeOut > M_RC522_VALIDATION_TIMEOUT)
+			{
+				s_rc522.s_status.s_IDStatus.isIDValid = RESET;
+				s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD;
+				break;
+			}
+		}
+		break;
+
+	default:
+		s_rc522_DMA.step = M_RC522_READSTEP_FINDCARD;
+		break;
+	}
 }
+
+
+void ResetRFID(void)
+{
+	memset(&s_rc522_internal, RESET, sizeof(s_rc522_internal));
+	memset(&s_rc522.s_status, RESET, sizeof(s_rc522.s_status));
+	Module_deinit();
+}
+
+
+void Module_deinit(void)
+{
+	s_rc522.s_status.s_detection.isInitialized = RESET;
+	s_rc522.s_status.s_detection.isDetectionEnabled = RESET;
+	s_rc522.s_status.s_detection.isModuleOn = RESET;
+
+	rfidOFFread = SET;
+	rfidOFFwrite = SET;
+	rfidOFFtoCard = SET;
+}
+
+
+void RC522_startTransmit(void)
+{
+	HAL_GPIO_WritePin(MFRC522_CS_PORT,MFRC522_CS_PIN,GPIO_PIN_RESET);
+}
+
+void RC522_endTransmit(void)
+{
+	HAL_GPIO_WritePin(MFRC522_CS_PORT, MFRC522_CS_PIN, GPIO_PIN_SET);
+}
+
+HAL_StatusTypeDef RC522_Write(uint8_t addr, uint8_t val)
+{
+	HAL_StatusTypeDef result = HAL_BUSY;
+	static e_rc522_read_write_step_typedef readWriteSteps = M_RC522_READWRITE_STEP_ONE;
+	if (rfidOFFwrite)
+	{
+		rfidOFFwrite = RESET;
+		readWriteSteps = M_RC522_READWRITE_STEP_ONE;
+	}
+	switch (readWriteSteps) {
+	case M_RC522_READWRITE_STEP_ONE:
+		s_rc522_DMA.DMATxResponse = RESET;
+		s_rc522_DMA.txData[0] = ((addr << 1) & 0x7E);
+		s_rc522_DMA.txData[1] = val;
+		RC522_startTransmit();
+		if(HAL_SPI_Transmit_DMA(&M_CONFIG_RC522_SPIHANDLE, s_rc522_DMA.txData, 2) == HAL_OK){
+			readWriteSteps = M_RC522_READWRITE_STEP_TWO;
+		}
+		break;
+
+	case M_RC522_READWRITE_STEP_TWO:
+		if(s_rc522_DMA.DMATxResponse == RESET){
+			break;
+		}
+		s_rc522_DMA.DMATxResponse = RESET;
+		readWriteSteps = M_RC522_READWRITE_STEP_ONE;
+		result = HAL_OK;
+		break;
+
+
+	default:
+		readWriteSteps = M_RC522_READWRITE_STEP_ONE;
+		break;
+	}
+	return result;
+}
+
+HAL_StatusTypeDef RC522_Read(uint8_t addr, uint8_t* readValue)
+{
+	HAL_StatusTypeDef result = HAL_BUSY;
+	static e_rc522_read_write_step_typedef readReadSteps = M_RC522_READWRITE_STEP_ONE;
+
+	if (rfidOFFread)
+	{
+		rfidOFFread = RESET;
+		readReadSteps = M_RC522_READWRITE_STEP_ONE;
+	}
+	switch (readReadSteps) {
+	case M_RC522_READWRITE_STEP_ONE:
+		s_rc522_DMA.DMATxResponse = RESET;
+		s_rc522_DMA.txData[0] = (((addr << 1) & 0x7E) | 0x80);
+		s_rc522_DMA.txData[1] = 0x00;
+		RC522_startTransmit();
+		if(HAL_SPI_TransmitReceive_DMA(&M_CONFIG_RC522_SPIHANDLE, s_rc522_DMA.txData, s_rc522_DMA.rxData, 2) == HAL_OK){
+			readReadSteps = M_RC522_READWRITE_STEP_TWO;
+		}
+		break;
+
+	case M_RC522_READWRITE_STEP_TWO:
+		if(s_rc522_DMA.DMATxRxResponse == RESET){
+			break;
+		}
+		s_rc522_DMA.DMATxRxResponse = RESET;
+		*readValue = s_rc522_DMA.rxData[1];
+		readReadSteps = M_RC522_READWRITE_STEP_ONE;
+		result = HAL_OK;
+		break;
+
+	default:
+		readReadSteps = M_RC522_READWRITE_STEP_ONE;
+		break;
+	}
+	return result;
+}
+
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+	if (hspi == &M_CONFIG_RC522_SPIHANDLE)
+	{
+		RC522_endTransmit();
+		if (s_rc522.s_status.s_detection.isModuleOn)
+		{
+			s_rc522_DMA.DMATxRxResponse = SET;
+		}
+	}
+}
+
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+	if (hspi == &M_CONFIG_RC522_SPIHANDLE)
+	{
+		RC522_endTransmit();
+		if (s_rc522.s_status.s_detection.isModuleOn)
+		{
+			s_rc522_DMA.DMATxResponse = SET;
+		}
+	}
+}
+
+
+
+

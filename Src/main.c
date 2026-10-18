@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include "rc522.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -101,6 +102,8 @@ int main(void)
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
 
+  /* RC522_tick() must be called every 1 ms: add it to SysTick_Handler()
+   * in stm32f1xx_it.c (USER CODE BEGIN SysTick_IRQn 1) */
   RC522_init();
   RC522_startDetection();
 
@@ -114,6 +117,17 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	  RC522_run();
+
+	  if (s_rc522.s_status.s_IDStatus.isUnreadWaiting)
+	  {
+		  s_rc522.s_status.s_IDStatus.isUnreadWaiting = RESET;
+
+		  char msg[40];
+		  int len = snprintf(msg, sizeof(msg), "Card ID: %02X %02X %02X %02X\r\n",
+				  s_rc522.s_status.s_IDStatus.cardID[0], s_rc522.s_status.s_IDStatus.cardID[1],
+				  s_rc522.s_status.s_IDStatus.cardID[2], s_rc522.s_status.s_IDStatus.cardID[3]);
+		  HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)len, 100);
+	  }
   }
   /* USER CODE END 3 */
 }
