@@ -4,6 +4,10 @@ A driver for the MFRC522 (RC522) RFID reader for STM32 HAL projects. After a sho
 
 It was developed on an STM32F103C8 ("Blue Pill") in STM32CubeIDE.
 
+<p align="center">
+  <img src="rc522_module.jpg" alt="RC522 RFID reader module wired for SPI" width="400">
+</p>
+
 ## Files
 
 ```
